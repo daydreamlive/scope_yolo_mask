@@ -1,0 +1,26 @@
+[project]
+name = "scope-yolo-mask"
+version = "0.1.0"
+description = "YOLO26 person segmentation preprocessor for Daydream Scope"
+readme = "README.md"
+requires-python = ">=3.11"
+license = "Apache-2.0"
+dependencies = [
+    "ultralytics>=8.4.0",
+]
+
+[project.entry-points.scope]
+yolo_mask = "scope_yolo_mask:plugin"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/scope_yolo_mask"]
+
+[tool.ruff]
+line-length = 88
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "W"]
