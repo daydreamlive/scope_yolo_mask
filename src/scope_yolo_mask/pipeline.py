@@ -97,8 +97,14 @@ class YOLOMaskPipeline(Pipeline):
         logger.info(f"YOLO26 model loaded on {self.device}")
 
     def prepare(self, **kwargs) -> Requirements:
-        # Use chunk size from downstream pipeline (passed via parameters)
-        return Requirements(input_size=kwargs.get("input_size"))
+        # Use chunk size from downstream pipeline (passed via next_input_size parameter)
+        next_input_size = kwargs.get("next_input_size")
+        if next_input_size is None:
+            raise ValueError(
+                "YOLOMaskPipeline requires next_input_size from downstream pipeline. "
+                f"Got kwargs: {list(kwargs.keys())}"
+            )
+        return Requirements(input_size=next_input_size)
 
     @torch.no_grad()
     def __call__(self, **kwargs) -> dict:
@@ -106,6 +112,8 @@ class YOLOMaskPipeline(Pipeline):
 
         Args:
             video: Input video frames as list of tensors (THWC format, [0, 255] range)
+            height: Target height for output frames (from downstream pipeline)
+            width: Target width for output frames (from downstream pipeline)
 
         Returns:
             Dict with:
@@ -115,10 +123,18 @@ class YOLOMaskPipeline(Pipeline):
         """
         video = kwargs.get("video")
         if video is None:
-            raise ValueError("Input video cannot be None for YOLOMaskPipeline")
+            raise ValueError("__call__: Input video cannot be None for YOLOMaskPipeline")
 
-        # Normalize frame sizes
-        video = normalize_frame_sizes(video)
+        # Get target resolution from downstream pipeline
+        target_height = kwargs.get("height")
+        target_width = kwargs.get("width")
+
+        # Normalize frame sizes to target resolution
+        video = normalize_frame_sizes(
+            video,
+            target_height=target_height,
+            target_width=target_width,
+        )
 
         masks_list = []
         passthrough_frames = []
