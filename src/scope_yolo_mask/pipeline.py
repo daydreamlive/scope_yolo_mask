@@ -98,7 +98,7 @@ class YOLOMaskPipeline(Pipeline):
 
     def prepare(self, **kwargs) -> Requirements:
         # Use chunk size from downstream pipeline (passed via parameters)
-        return Requirements(input_size=kwargs.get("input_size"))
+        return Requirements(input_size=12)
 
     @torch.no_grad()
     def __call__(self, **kwargs) -> dict:
