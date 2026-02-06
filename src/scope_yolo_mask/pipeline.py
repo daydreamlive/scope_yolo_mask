@@ -1,4 +1,4 @@
-"""YOLO26 person segmentation pipeline for realtime mask extraction."""
+"""YOLO26 segmentation pipeline for realtime mask extraction."""
 
 import logging
 from typing import TYPE_CHECKING
@@ -9,7 +9,7 @@ from scope.core.config import get_models_dir
 from scope.core.pipelines.interface import Pipeline, Requirements
 from scope.core.pipelines.process import normalize_frame_sizes
 
-from .schema import YOLOMaskConfig
+from .schema import COCO_CLASSES, YOLOMaskConfig
 
 if TYPE_CHECKING:
     from scope.core.pipelines.base_schema import BasePipelineConfig
@@ -28,12 +28,17 @@ MODEL_VARIANTS = {
 # Subdirectory for YOLO models within scope models dir
 YOLO_MODELS_SUBDIR = "ultralytics"
 
+# Overlay color (green) and blend alpha
+OVERLAY_COLOR = (0.0, 0.8, 0.0)
+OVERLAY_ALPHA = 0.4
+
 
 class YOLOMaskPipeline(Pipeline):
-    """YOLO26 person segmentation preprocessor.
+    """YOLO26 segmentation pipeline.
 
-    Detects people in video frames and outputs binary masks suitable for
-    VACE conditioning. Returns both video passthrough and masks.
+    Detects and segments objects in video frames. Can be used as:
+    - Preprocessor: outputs VACE-compatible masks for downstream pipelines
+    - Standalone pipeline: outputs mask visualization or overlay
     """
 
     @classmethod
@@ -46,9 +51,6 @@ class YOLOMaskPipeline(Pipeline):
         dtype: torch.dtype = torch.float16,
         model_size: str = "nano",
         use_tensorrt: bool = False,
-        confidence_threshold: float = 0.5,
-        target_classes: list[int] | None = None,
-        invert_mask: bool = False,
         **kwargs,
     ):
         """Initialize the YOLO mask pipeline.
@@ -58,9 +60,6 @@ class YOLOMaskPipeline(Pipeline):
             dtype: Data type for inference (default: float16)
             model_size: Model variant - nano/small/medium/large/xlarge
             use_tensorrt: Whether to use TensorRT acceleration
-            confidence_threshold: Detection confidence threshold
-            target_classes: COCO class IDs to segment (default: [0] for person)
-            invert_mask: If True, mask background instead of detected objects
             **kwargs: Extra params from pipeline manager (ignored)
         """
         from ultralytics import YOLO
@@ -71,9 +70,6 @@ class YOLOMaskPipeline(Pipeline):
             else torch.device("cuda" if torch.cuda.is_available() else "cpu")
         )
         self.dtype = dtype
-        self.confidence_threshold = confidence_threshold
-        self.target_classes = target_classes if target_classes is not None else [0]
-        self.invert_mask = invert_mask
 
         # Get model path in scope models directory
         model_filename = MODEL_VARIANTS.get(model_size, MODEL_VARIANTS["nano"])
@@ -88,7 +84,9 @@ class YOLOMaskPipeline(Pipeline):
             engine_path = model_path.with_suffix(".engine")
             if not engine_path.exists():
                 base_model = YOLO(str(model_path))
-                engine_path = base_model.export(format="engine", half=dtype == torch.float16)
+                engine_path = base_model.export(
+                    format="engine", half=dtype == torch.float16
+                )
             self.model = YOLO(str(engine_path))
             logger.info(f"Loaded TensorRT engine: {engine_path}")
         else:
@@ -97,31 +95,43 @@ class YOLOMaskPipeline(Pipeline):
         logger.info(f"YOLO26 model loaded on {self.device}")
 
     def prepare(self, **kwargs) -> Requirements:
-        # Use chunk size from downstream pipeline (passed via parameters)
         return Requirements(input_size=12)
 
     @torch.no_grad()
     def __call__(self, **kwargs) -> dict:
-        """Segment people in video frames.
+        """Segment objects in video frames.
 
         Args:
             video: Input video frames as list of tensors (THWC format, [0, 255] range)
+            output_mode: "mask" for binary mask, "overlay" for mask on original frame
+            target_class: COCO class name to segment (e.g. "person", "car")
+            confidence_threshold: Detection confidence threshold
+            invert_mask: If True, invert the mask
 
         Returns:
             Dict with:
-                - video: Passthrough frames (THWC, [0, 1] range) for queue
-                - vace_input_frames: Video in VACE format [B, C, F, H, W], [-1, 1], on CUDA
-                - vace_input_masks: Binary masks [B, 1, F, H, W] on CUDA
+                - video: Output frames (THWC, [0, 1] range) based on output_mode
+                - vace_input_frames: Video in VACE format [B, C, F, H, W], [-1, 1]
+                - vace_input_masks: Binary masks [B, 1, F, H, W]
         """
         video = kwargs.get("video")
         if video is None:
             raise ValueError("Input video cannot be None for YOLOMaskPipeline")
 
+        # Runtime parameters
+        output_mode = kwargs.get("output_mode", "mask")
+        target_class = kwargs.get("target_class", "person")
+        confidence_threshold = kwargs.get("confidence_threshold", 0.5)
+        invert_mask = kwargs.get("invert_mask", False)
+
+        # Convert class name to COCO class ID
+        target_class_id = COCO_CLASSES.get(target_class, 0)
+
         # Normalize frame sizes
         video = normalize_frame_sizes(video)
 
         masks_list = []
-        passthrough_frames = []
+        display_frames = []
         vace_frames = []
 
         for frame in video:
@@ -140,12 +150,12 @@ class YOLOMaskPipeline(Pipeline):
             # Run YOLO inference
             results = self.model(
                 frame_np,
-                conf=self.confidence_threshold,
-                classes=self.target_classes,
+                conf=confidence_threshold,
+                classes=[target_class_id],
                 verbose=False,
             )
 
-            # Extract and union person masks (keep on GPU)
+            # Extract and union masks (keep on GPU)
             result = results[0]
             if result.masks is not None and len(result.masks.data) > 0:
                 # masks.data is (num_objects, H, W) - already on GPU
@@ -153,8 +163,10 @@ class YOLOMaskPipeline(Pipeline):
                 combined_mask = all_masks.max(dim=0).values  # (H, W)
                 combined_mask = combined_mask.to(self.device)
             else:
-                # No persons detected - empty mask on GPU
-                combined_mask = torch.zeros((h, w), dtype=torch.float32, device=self.device)
+                # No objects detected - empty mask on GPU
+                combined_mask = torch.zeros(
+                    (h, w), dtype=torch.float32, device=self.device
+                )
 
             # Ensure mask matches frame dimensions (on GPU)
             if combined_mask.shape != (h, w):
@@ -166,7 +178,7 @@ class YOLOMaskPipeline(Pipeline):
 
             # Binary threshold and optional inversion
             combined_mask = (combined_mask > 0.5).float()
-            if self.invert_mask:
+            if invert_mask:
                 combined_mask = 1.0 - combined_mask
             masks_list.append(combined_mask)
 
@@ -175,12 +187,26 @@ class YOLOMaskPipeline(Pipeline):
             if frame_gpu.max() > 1.0:
                 frame_gpu = frame_gpu / 255.0
 
-            # Store for passthrough (will move to CPU in bulk at end)
-            passthrough_frames.append(frame_gpu)
+            # Build display frame based on output mode
+            mask_expanded = combined_mask.unsqueeze(-1)  # [H, W, 1]
+            if output_mode == "overlay":
+                # Blend colored mask with original frame
+                overlay_color = torch.tensor(
+                    OVERLAY_COLOR, device=self.device, dtype=frame_gpu.dtype
+                )
+                color_layer = mask_expanded * overlay_color  # [H, W, 3]
+                display_frame = (
+                    frame_gpu * (1.0 - mask_expanded * OVERLAY_ALPHA)
+                    + color_layer * OVERLAY_ALPHA
+                )
+            else:
+                # Binary mask as 3-channel grayscale image
+                display_frame = mask_expanded.expand_as(frame_gpu)
+
+            display_frames.append(display_frame)
 
             # VACE format: apply mask to frame (all on GPU)
             # mask=1 means "inpaint this region", fill with gray (0.5)
-            mask_expanded = combined_mask.unsqueeze(-1)  # [H, W, 1]
             masked_frame = torch.where(
                 mask_expanded > 0.5,
                 torch.tensor(0.5, device=self.device, dtype=frame_gpu.dtype),
@@ -190,8 +216,8 @@ class YOLOMaskPipeline(Pipeline):
             vace_frame = masked_frame * 2.0 - 1.0  # [H, W, C] in [-1, 1]
             vace_frames.append(vace_frame)
 
-        # Stack passthrough frames: (T, H, W, C) on CPU for queue
-        video_out = torch.stack(passthrough_frames, dim=0).cpu()
+        # Stack display frames: (T, H, W, C) on CPU for queue
+        video_out = torch.stack(display_frames, dim=0).cpu()
 
         # Stack VACE frames: [F, H, W, C] -> [1, C, F, H, W] on CUDA
         vace_video = torch.stack(vace_frames, dim=0)  # (F, H, W, C)
